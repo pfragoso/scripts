@@ -1,0 +1,350 @@
+#!/usr/bin/python
+# coding: utf-8
+
+import os
+import sys
+import debian.debian_support
+import subprocess
+import tempfile
+from shutil import copytree, rmtree, copy2, move
+from fileinput import FileInput
+
+from ubuntutools.archive import Dsc, UbuntuSourcePackage
+from ubuntutools.logger import Logger
+from debian.changelog import Changelog, Version
+
+#Config 
+
+# Example: {'file1':'debian/'}
+# FILES_ADD = {'file1': 'debian/', 'file2/': 'lib/'}
+# If we want to copy to sourcedir just use package Ex. 'file1': 'package'
+# FILES_DEL = [ 'debian/rules', 'lib/']
+#if we want to just rename a directory
+# RENAME_DIRS = {'debian/old_name1/' : 'debian/new_name1/'}
+
+FILES_ADD = {}
+FILES_DEL = [] 
+RENAME_DIRS = {} 
+
+#Use this var we if want to hardcode the version
+#If you hardcode the version please add the xcm tag
+VERSION=""
+
+# debdiff old.dsc new.dsc > cmiffy/debdiff.patch
+debdiff_file="debdiff.patch"
+
+#Changelog stuff
+AUTHOR='Pedro Fragoso <pedro.fragoso@caixamagica.pt>'
+DISTRO=""
+URGE="low"
+
+#CHANGE="""  * Add horn as valid distro  * New version  """
+CHANGE="""  * Add horn as valid distro  """
+
+#If we need to change the package source to magicbox
+RENAME_PACKAGE="True"
+
+def remove_trunk(cmdir):
+	""" Remove old trunk files """	
+
+	for file in os.listdir(trunk_dir):
+		if file == '.svn':
+			pass
+		else:
+			cmd = ["svn", "del", trunk_dir + '/'+ file, '--force']
+			Logger.command(cmd)
+			if subprocess.call(cmd) != 0:
+				Logger.warn("Failed remove trunk files")
+
+def tempdir_name():
+	""" Create tempdir """
+
+	workdir = tempfile.mkdtemp(dir=os.getcwd(), prefix='build')
+
+	return workdir
+
+def tempdir_create(workdir):
+	""" Create tempdir """
+	if not os.path.exists(workdir):
+		os.makedirs(workdir)
+
+	for file in os.listdir("."):
+		if file == sys.argv[0] or file == workdir.split("/")[-1]:
+			pass
+		else:
+			if os.path.isdir(file):
+				copytree(file, workdir + "/" + file)
+			else:
+				copy2(file, workdir)
+
+def find_dsc(workdir):
+	""" Find dsc in path and use it (only one for the moment) """
+	dsc_file = []
+	os.chdir(workdir)
+	for file in os.listdir("."):
+		if file.endswith(".dsc"):
+			dsc_file.append(file)
+	
+	if len(dsc_file) == 0:
+		Logger.error("No dsc file found in %s") % workdir
+		sys.exit(1)	
+
+	if len(dsc_file) > 1:
+		Logger.error("Found more than one dsc")
+		sys.exit(1)	
+
+	return dsc_file
+
+
+def build_package(dsc_file, workdir):
+	""" Get the source and the Version from the DSC file """
+	dsc_file_path = os.path.abspath("".join(dsc_file))
+
+	dsc = Dsc(open(dsc_file_path, 'rb').read())	
+
+	dsc.version = dsc['Version']
+	dsc.source = dsc['Source']
+
+	pkg = UbuntuSourcePackage(dsc.source, dsc.version)
+	upver = debian.debian_support.Version(pkg.version).upstream_version
+	sources_dir = '%s/%s-%s/' % (workdir, pkg.source, upver)
+	
+	unpack_source(dsc_file)
+	
+	remove_cm_files(sources_dir)
+
+	add_cm_files(workdir, sources_dir)
+
+	if os.path.exists(os.path.join(workdir,debdiff_file)):
+		remove_changelog_cruft()
+		apply_patch(sources_dir, workdir)
+		
+	else:
+		Logger.warn("debdiff.patch NOT FOUND, skipping")
+
+	rename_dirs(sources_dir)
+
+	add_changelog(pkg.source.encode('ascii'), upver, dsc.version, sources_dir)
+
+	debuild_package()
+
+def unpack_source(dsc_file):
+	""" Unpack the dsc file """
+	
+	cmd = ['dpkg-source', '--skip-patches', '-x', "".join(dsc_file)]
+	Logger.command(cmd)
+	if subprocess.call(cmd) != 0:
+		Logger.error('Source unpack failed.')
+		sys.exit(1)
+
+
+# Add files or dirs
+
+def add_cm_files(workdir, sources_dir):
+	""" Copy our files """
+	if FILES_ADD:
+		for keys, values in FILES_ADD.iteritems():
+			file_path=os.path.join(workdir + '/',keys)
+			if os.path.exists(file_path):
+                        	if os.path.isdir(file_path):
+					if values == "package":
+						copytree(file_path, sources_dir + keys)
+                        	
+					else:
+						copytree(file_path, sources_dir + values + '/' + keys)
+				else:
+					if values == "package":
+						copy2(file_path, sources_dir)
+					else:
+						copy2(file_path, sources_dir + values)
+			else:
+				Logger.error("Failed to add %s NOT FOUND" % file_path)
+				sys.exit(1)
+# Remove files and dirs
+
+def remove_cm_files(sources_dir):
+	""" Remove files and dirs from srcpkg """
+	if FILES_DEL:
+		for index in FILES_DEL:
+			file_path=os.path.join(sources_dir + index)
+			if os.path.exists(file_path):
+				if os.path.isdir(file_path):
+					rmtree(file_path)
+				else:
+					os.remove(file_path)					
+			else:
+				Logger.error("Failed to remove %s NOT FOUND" % file_path)
+				sys.exit(1)
+
+def rename_dirs(sources_dir):
+	""" Rename dirs """
+	if RENAME_DIRS:
+		for keys, values in RENAME_DIRS.iteritems():
+			file_path=os.path.join(sources_dir + '/',keys)
+			if os.path.exists(file_path):
+				move(file_path, sources_dir + values)
+			else:
+				Logger.error("Failed to rename")
+
+#Remove changelog tag from debdiff
+
+def remove_changelog_cruft():
+	""" Remove changelog cruft from previous debdiff """
+	if os.path.exists(debdiff_file):
+		cmd = ['filterdiff', '-x' '*debian/changelog*', debdiff_file]
+		proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+		out = proc.communicate()[0]
+		file = open(debdiff_file, 'w')
+		file.write(out)
+		file.close()
+	else:
+		Logger.error("Failed to filterdiff changelog")
+        	sys.exit(1)
+
+
+#Apply Patch Section
+
+def apply_patch(sources_dir, workdir):
+	try:
+		# filterdiff removes the changelog so this will surely fail
+		#debdiff = Patch(debdiff_file)
+		#if debdiff.is_debdiff():
+		#cmd = ["patch", "-p", str(debdiff.get_strip_level()), "-i", debdiff.full_path]
+		os.chdir(sources_dir)
+		cmd = ["patch", "-p1", "-i", workdir + '/' + debdiff_file] 
+		Logger.command(cmd)
+		if subprocess.call(cmd) != 0:
+			Logger.error("Failed to apply debdiff") 
+			sys.exit(1)
+
+	except AssertionError:
+		Logger.error("Could not find %s file" % debdiff_file)
+		sys.exit(1)
+
+
+def get_distro(file):
+	
+	KNOWN_DISTRO = {'natty':'horn'}
+
+	filename = open(file, "r").read()
+
+	changelog = Changelog(filename)
+
+	for ubudistro, magicdistro in KNOWN_DISTRO.iteritems():
+		if ubudistro in changelog.distributions:
+			distro =  changelog.distributions.replace(ubudistro, magicdistro)
+			return distro
+		else:
+			Logger.error("Failed distro not found")
+			sys.exit(1)
+
+#Add Changelog entry
+
+def add_changelog(source, up_version, dsc_version, sources_dir):
+	""" Add a changelog entry with our changes """
+
+	
+	os.chdir(sources_dir)
+	cmd = ['date', '-R']
+	proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+	DATE = proc.communicate()[0]
+	
+
+	if len(VERSION) >= 1:
+		version = VERSION
+	else:
+		if "ubuntu" in dsc_version:
+			version = dsc_version.replace("ubuntu", "xcm")
+
+		else:
+			version = dsc_version + "xcm1"
+
+	if RENAME_PACKAGE == "True":
+		source = source.replace("ubuntu", "magicbox")
+		
+
+        filename = '%s/debian/changelog' % sources_dir
+	
+	if len(DISTRO) > 0:
+		distro = DISTRO
+	else:
+		distro = get_distro(filename)
+
+	changelog = Changelog()
+
+	changelog.new_block(package=source,
+			    version=version,
+			    distributions=distro,
+		    	    author=AUTHOR,
+			    urgency=URGE,
+			    date=DATE.rstrip(),
+			    )
+
+	changelog.add_change('')
+	changelog.add_change(CHANGE)
+	changelog.add_change('')
+
+
+	try:
+		fobj = FileInput(filename, inplace=1)
+	        first_line = fobj.readline()
+		sys.stdout.write("%s%s" % (changelog, first_line))
+		for line in fobj:
+        		sys.stdout.write("%s" % line)
+ 		
+	finally:
+		fobj.close()
+
+
+def debuild_package():
+	""" Debuild package """
+	cmd = ["debuild", "-S", "-sa"]
+	Logger.command(cmd)
+	returncode = subprocess.call(cmd)
+	if returncode != 0:
+		Logger.error('Source-only build with debuild failed. '
+                	         'Please check build log above.')
+		sys.exit(1)
+
+#Were fine, lets cleanup
+
+def cleanup(workdir, trunk_dir):
+	""" Clean up tempdir and copy the right files do trunk/ """
+	for file in os.listdir(workdir):
+		if "xcm" in file:
+			if file.endswith(".build"):
+				pass
+			else:
+				copy2(os.path.join(workdir, file), trunk_dir + "/" + file)
+				cmd = ["svn", "add", trunk_dir + '/'+ file]
+				Logger.command(cmd)
+				returncode = subprocess.call(cmd)
+				if returncode != 0:
+					Logger.error('Failed to add to svn')
+					sys.exit(1)
+
+        for file in os.listdir(workdir):
+                if "orig" in file:
+                	copy2(os.path.join(workdir, file), trunk_dir + "/" + file)
+                	cmd = ["svn", "add", trunk_dir + '/'+ file]
+                        Logger.command(cmd)
+                        returncode = subprocess.call(cmd)
+                        if returncode != 0:
+                        	Logger.error('Failed to add to svn')
+                                sys.exit(1)
+        
+        
+	rmtree(workdir)
+
+
+if __name__ == "__main__":
+	repo_dir = os.getcwd()
+	trunk_dir = repo_dir.replace("cmiffy", "trunk")
+
+	remove_trunk(repo_dir)
+	build_dir = tempdir_name()
+	tempdir_create(build_dir)
+	dscfile = find_dsc(build_dir)
+	build_package(dscfile, build_dir)
+	
+	cleanup(build_dir, trunk_dir)
